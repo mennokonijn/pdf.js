@@ -1,0 +1,168 @@
+name: Quality Metrics Pipeline
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Start Express App
+        run: |
+          PORT=8888 npx gulp server &
+
+      - name: Wait for app to be ready
+        run: |
+          sleep 10
+
+      - name: Run OWASP ZAP Baseline Scan
+        run: |
+          docker run -u root --network host \
+            -v $(pwd):/zap/wrk/:rw \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:8888 \
+            -g zap-gen.conf \
+            -r zap-report.html \
+            -J zap-report.json \
+            -z "-config api.disablekey=true"
+        continue-on-error: true
+
+      - name: Send ZAP results to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: ZAP' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @zap-report.json
+
+      - name: Install Depcheck
+        run: |
+          npm install -g depcheck
+
+      - name: Run Depcheck
+        run: |
+          depcheck --json > depcheck-results.json || true
+
+      - name: Send Depcheck results to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: Depcheck' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @depcheck-results.json
+
+      - name: Install GitLeaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: Run GitLeaks
+        run: |
+          gitleaks detect \
+            --source=. \
+            --report-format json \
+            --report-path=gitleaks.json \
+            --no-git
+        continue-on-error: true
+
+      - name: Send GitLeaks results to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: GitLeaks' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @gitleaks.json
+
+      - name: Install SonarScanner
+        run: |
+          npm install -g sonarqube-scanner
+
+      - name: Run SonarQube Analysis
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
+            -Dsonar.sources=src \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+      - name: Wait for SonarQube Analysis to Complete
+        run: |
+          echo 'Waiting for SonarQube analysis...' && \
+          while true; do \
+            STATUS=$(curl -s -u ${{ secrets.SONAR_TOKEN }}: "${{ secrets.SONAR_HOST_URL }}/api/ce/component?component=${{ secrets.SONAR_PROJECT_KEY }}" | jq -r '.current.status'); \
+            echo "Current SonarQube status: $STATUS"; \
+            if [ "$STATUS" = "SUCCESS" ] || [ "$STATUS" = "FAILED" ]; then break; fi; \
+            sleep 5; \
+          done
+
+      - name: Fetch SonarQube Metrics
+        run: |
+          curl -s -u ${{ secrets.SONAR_TOKEN }}: \
+            "${{ secrets.SONAR_HOST_URL }}/api/measures/component?component=${{ secrets.SONAR_PROJECT_KEY }}&metricKeys=functions,ncloc,code_smells,cognitive_complexity,complexity,duplicated_lines_density" \
+            -o sonar-results.json
+
+      - name: Send SonarQube results to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: SonarQube' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @sonar-results.json
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Install CycloneDX SBOM Generator
+        run: |
+          npm install --save-dev @cyclonedx/cyclonedx-npm
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          npx cyclonedx-npm --output-format json > bom.json
+
+      - name: Run Trivy on SBOM (licenses + CVEs)
+        run: |
+          trivy sbom --scanners vuln,license --format json --output trivy-results.json bom.json
+
+      - name: Send Trivy results to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: Trivy' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @trivy-results.json
+
+      - name: Fetch Programming Language Breakdown
+        run: |
+          echo "Fetching language breakdown from GitHub API..."
+          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/languages \
+            -o languages.json
+
+      - name: Send Language Energy Impact to API
+        run: |
+          curl -X POST https://6d888b3b7a17.ngrok-free.app/api/metrics \
+            -H 'Content-Type: application/json' \
+            -H 'X-Tool-Name: Language-Impact' \
+            -H 'X-Repo-Name: https://github.com/mennokonijn/pdf.js' \
+            --data @languages.json
