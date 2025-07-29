@@ -39,7 +39,7 @@ jobs:
 
       - name: Start App
         run: |
-          PORT=8888 npx gulp start &
+          PORT=8888 npx gulp server &
 
       - name: Wait for app to be ready
         run: |
